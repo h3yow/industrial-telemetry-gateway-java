@@ -8,6 +8,7 @@ import com.github.h3yow.industrialtelemetrygatewayjava.channel.SimulatedChannelT
 import com.github.h3yow.industrialtelemetrygatewayjava.channel.ValueOutOfBoundsException;
 import com.github.h3yow.industrialtelemetrygatewayjava.error.ErrorCategory;
 import com.github.h3yow.industrialtelemetrygatewayjava.error.GatewayException;
+import com.github.h3yow.industrialtelemetrygatewayjava.model.BatchWriteResult;
 import com.github.h3yow.industrialtelemetrygatewayjava.model.PointDefinition;
 import com.github.h3yow.industrialtelemetrygatewayjava.model.PointType;
 import com.github.h3yow.industrialtelemetrygatewayjava.model.Sample;
@@ -55,6 +56,21 @@ public class SimulatedDevice {
     private final Map<String, Long> versions = new HashMap<>();
     private volatile long commitSeq = 0L;
     private volatile boolean connected;
+
+    /**
+     * 提交监听器：在写锁内、状态提交之后、锁释放之前同步回调。
+     * 参数为提交后的全局 commitSeq。供需要与设备状态严格同步的观察者使用，
+     * 避免“锁外事后登记”造成的观察竞态。
+     */
+    public interface CommitListener {
+        void onCommitted(long commitSeq);
+    }
+
+    private volatile CommitListener commitListener;
+
+    public void setCommitListener(CommitListener listener) {
+        this.commitListener = listener;
+    }
 
     public SimulatedDevice(String deviceId, SimulatedChannel channel, List<PointDefinition> points) {
         this.deviceId = deviceId;
@@ -178,7 +194,67 @@ public class SimulatedDevice {
             commitSeq++;
             log.info("[{}] write accepted: point={}, value={}, version {} -> {}, commitSeq={}",
                     deviceId, point.name(), request.value(), currentVersion, newVersion, commitSeq);
+            notifyCommitted();
             return WriteOutcome.accepted(newVersion);
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+
+    /**
+     * 原子批量写入：一批点位作为一次逻辑提交。
+     * <p>
+     * 先在写锁内解析点位并做版本预检，任一点位过期即整批拒绝（不触碰通道、状态不变）；
+     * 全部通过后编码、写通道，最后统一推进各点位版本与唯一一次 commitSeq。
+     * 因而一致性快照永远观察不到“这批点位一半新一半旧”。
+     */
+    public BatchWriteResult writeBatch(List<WriteRequest> requests) {
+        if (requests.isEmpty()) {
+            throw new GatewayException(ErrorCategory.VALUE_OUT_OF_RANGE,
+                    "writeBatch requires at least one request on " + deviceId);
+        }
+        lock.writeLock().lock();
+        try {
+            requireConnected();
+
+            List<PointDefinition> targets = new ArrayList<>(requests.size());
+            List<Long> currentVersions = new ArrayList<>(requests.size());
+            for (WriteRequest request : requests) {
+                PointDefinition point = findPoint(request.name());
+                long currentVersion = versions.get(point.name());
+                if (request.expectedVersion() != null
+                        && request.expectedVersion() != currentVersion) {
+                    List<WriteOutcome> rejected = new ArrayList<>();
+                    for (PointDefinition t : targets) {
+                        rejected.add(WriteOutcome.rejected(versions.get(t.name()),
+                                readFromChannel(t)));
+                    }
+                    log.info("[{}] batch STALE rejected at point={}, expected={}, actual={}",
+                            deviceId, point.name(), request.expectedVersion(), currentVersion);
+                    return new BatchWriteResult(false, commitSeq, List.copyOf(rejected),
+                            "stale version at point " + point.name() + ": expected "
+                                    + request.expectedVersion() + " but actual " + currentVersion);
+                }
+                targets.add(point);
+                currentVersions.add(currentVersion);
+            }
+
+            // 编码（越界校验）与通道写入全部完成后才提交版本
+            for (int i = 0; i < requests.size(); i++) {
+                writeToChannel(targets.get(i), requests.get(i).value());
+            }
+            List<WriteOutcome> outcomes = new ArrayList<>(requests.size());
+            for (int i = 0; i < targets.size(); i++) {
+                long newVersion = currentVersions.get(i) + 1;
+                versions.put(targets.get(i).name(), newVersion);
+                outcomes.add(WriteOutcome.accepted(newVersion));
+            }
+            commitSeq++;
+            log.info("[{}] batch write accepted: points={}, commitSeq={}",
+                    deviceId, targets.stream().map(PointDefinition::name).toList(), commitSeq);
+            notifyCommitted();
+            return new BatchWriteResult(true, commitSeq, List.copyOf(outcomes),
+                    "batch of " + requests.size() + " point(s) committed atomically");
         } finally {
             lock.writeLock().unlock();
         }
@@ -192,6 +268,13 @@ public class SimulatedDevice {
         if (!connected) {
             throw new GatewayException(ErrorCategory.DEVICE_DISCONNECTED,
                     "device " + deviceId + " is disconnected");
+        }
+    }
+
+    private void notifyCommitted() {
+        CommitListener listener = commitListener;
+        if (listener != null) {
+            listener.onCommitted(commitSeq);
         }
     }
 
