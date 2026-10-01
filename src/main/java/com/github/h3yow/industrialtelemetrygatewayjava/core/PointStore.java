@@ -8,6 +8,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 /**
  * 点位存储：进程内版本化存储。
@@ -15,9 +16,11 @@ import java.util.concurrent.atomic.AtomicLong;
  * <p>并发与一致性策略：
  * <ul>
  *   <li>客户端写入采用基于版本的 CAS 仲裁：期望版本不匹配即拒绝，
- *       因此并发写入的最终状态由 CAS 顺序决定，是确定的。</li>
- *   <li>批量读取采用 seqlock 模式：读取前后各取一次修改计数，
- *       计数不变则证明读取期间没有写入，快照一致；否则重试。</li>
+ *       因此并发写入的最终状态由仲裁顺序决定，是确定的；
+ *       版本号在原子块内、确认成功后才会分配，每次成功写入版本恰好前进 1。</li>
+ *   <li>批量读取与写入/采集合并之间使用公平读写锁互斥：
+ *       快照在写锁保护的关键区之外不可能观察到写了一半的状态，
+ *       公平策略保证持续写入下读取者不会饿死。</li>
  *   <li>周期采集以“保留最大版本”的方式合并，采集版本在读取设备前
  *       分配，保证并发的客户端写入不会被旧采样覆盖。</li>
  * </ul>
@@ -25,11 +28,9 @@ import java.util.concurrent.atomic.AtomicLong;
 @Repository
 public class PointStore {
 
-    private static final int MAX_SNAPSHOT_RETRIES = 10_000;
-
     private final ConcurrentHashMap<Integer, PointValue> entries = new ConcurrentHashMap<>();
     private final AtomicLong versionCounter = new AtomicLong(0);
-    private final AtomicLong modificationCount = new AtomicLong(0);
+    private final ReentrantReadWriteLock consistencyLock = new ReentrantReadWriteLock(true);
 
     public PointValue get(int address) {
         return entries.get(address);
@@ -41,17 +42,20 @@ public class PointStore {
      * @return 写入成功后的新值；点位不存在或期望版本过期时返回 null
      */
     public PointValue compareAndSet(int address, double value, long expectedVersion) {
-        while (true) {
-            PointValue current = entries.get(address);
-            if (current == null || current.version() != expectedVersion) {
-                return null;
-            }
-            PointValue next = new PointValue(value, versionCounter.incrementAndGet(), Instant.now());
-            if (entries.replace(address, current, next)) {
-                modificationCount.incrementAndGet();
-                return next;
-            }
+        PointValue[] written = new PointValue[1];
+        consistencyLock.writeLock().lock();
+        try {
+            entries.compute(address, (key, current) -> {
+                if (current == null || current.version() != expectedVersion) {
+                    return current;
+                }
+                written[0] = new PointValue(value, versionCounter.incrementAndGet(), Instant.now());
+                return written[0];
+            });
+        } finally {
+            consistencyLock.writeLock().unlock();
         }
+        return written[0];
     }
 
     /**
@@ -59,18 +63,23 @@ public class PointStore {
      * 每个点位保留版本较大的值，避免旧采样覆盖新写入。
      */
     public void mergeAcquisition(Map<Integer, PointValue> sampled) {
-        sampled.forEach((address, sampledValue) ->
-                entries.merge(address, sampledValue,
-                        (existing, incoming) -> incoming.version() > existing.version() ? incoming : existing));
-        modificationCount.incrementAndGet();
+        consistencyLock.writeLock().lock();
+        try {
+            sampled.forEach((address, sampledValue) ->
+                    entries.merge(address, sampledValue,
+                            (existing, incoming) -> incoming.version() > existing.version() ? incoming : existing));
+        } finally {
+            consistencyLock.writeLock().unlock();
+        }
     }
 
     /**
-     * 批量一致性快照（seqlock）：返回的点位值读取期间没有任何写入发生。
+     * 批量一致性快照：在读锁保护下一次性读取全部点位，
+     * 返回的组合必然在某一时刻真实共存过。
      */
     public Map<Integer, PointValue> snapshot(Set<Integer> addresses) {
-        for (int attempt = 0; attempt < MAX_SNAPSHOT_RETRIES; attempt++) {
-            long before = modificationCount.get();
+        consistencyLock.readLock().lock();
+        try {
             Map<Integer, PointValue> result = new HashMap<>();
             for (int address : addresses) {
                 PointValue value = entries.get(address);
@@ -78,12 +87,10 @@ public class PointStore {
                     result.put(address, value);
                 }
             }
-            long after = modificationCount.get();
-            if (before == after) {
-                return result;
-            }
+            return result;
+        } finally {
+            consistencyLock.readLock().unlock();
         }
-        throw new IllegalStateException("unable to obtain a consistent snapshot, writes too frequent");
     }
 
     public Set<Integer> addresses() {
