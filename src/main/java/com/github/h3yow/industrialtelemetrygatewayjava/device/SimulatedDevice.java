@@ -82,13 +82,21 @@ public class SimulatedDevice {
             versions.put(point.name(), 0L);
         }
         this.connected = false;
-        // 建立底层连接并把初始值写入寄存器/线圈
+        // 建立底层连接；打开成功先视为在线
         channel.open();
         this.connected = true;
-        for (PointDefinition point : points) {
-            writeToChannel(point, point.initialValue());
+        // 把初始值写入寄存器/线圈。若建连后首次 IO 即失败（例如慢通道超时），
+        // 设备保持未连接状态，后续读写统一快速失败，而不是在构造期抛出。
+        try {
+            for (PointDefinition point : points) {
+                writeToChannel(point, point.initialValue());
+            }
+            log.info("[{}] simulated device online with {} point(s)", deviceId, points.size());
+        } catch (GatewayException e) {
+            this.connected = false;
+            log.warn("[{}] initial seeding failed ({}), device stays disconnected: {}",
+                    deviceId, e.category(), e.getMessage());
         }
-        log.info("[{}] simulated device online with {} point(s)", deviceId, points.size());
     }
 
     public String deviceId() {
@@ -137,6 +145,7 @@ public class SimulatedDevice {
         PointDefinition point = findPoint(name);
         lock.readLock().lock();
         try {
+            requireConnected();
             Number value = readFromChannel(point);
             return new Sample(point.name(), point.address(), value, versions.get(point.name()));
         } finally {
@@ -381,6 +390,8 @@ public class SimulatedDevice {
         } else if (e instanceof ChannelClosedException) {
             category = ErrorCategory.DEVICE_DISCONNECTED;
             message = "device " + deviceId + " channel is closed";
+            // 底层已关闭：同步设备状态，后续调用直接快速失败
+            connected = false;
         } else {
             category = ErrorCategory.INTERNAL_ERROR;
             message = "channel error at address " + address + " on device " + deviceId;
