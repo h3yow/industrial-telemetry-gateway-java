@@ -3,6 +3,7 @@ package com.github.h3yow.industrialtelemetrygatewayjava.gateway;
 import com.github.h3yow.industrialtelemetrygatewayjava.device.SimulatedDevice;
 import com.github.h3yow.industrialtelemetrygatewayjava.error.ErrorCategory;
 import com.github.h3yow.industrialtelemetrygatewayjava.error.GatewayException;
+import com.github.h3yow.industrialtelemetrygatewayjava.model.BatchWriteResult;
 import com.github.h3yow.industrialtelemetrygatewayjava.model.Sample;
 import com.github.h3yow.industrialtelemetrygatewayjava.model.Snapshot;
 import com.github.h3yow.industrialtelemetrygatewayjava.model.WriteOutcome;
@@ -56,7 +57,12 @@ public class TelemetryGateway {
         return requireDevice(deviceId).readSnapshot();
     }
 
-    public WriteOutcome write(WriteRequest request) {
-        return requireDevice(request.deviceId()).write(request);
+    public WriteOutcome write(WriteRequest domain) {
+        return requireDevice(domain.deviceId()).write(domain);
+    }
+
+    /** 原子批量写：一批点位一次提交，全部成功或全部不生效。 */
+    public BatchWriteResult writeBatch(String deviceId, List<WriteRequest> requests) {
+        return requireDevice(deviceId).writeBatch(requests);
     }
 }

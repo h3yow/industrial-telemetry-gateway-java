@@ -4,7 +4,10 @@ import com.github.h3yow.industrialtelemetrygatewayjava.gateway.TelemetryGateway;
 import com.github.h3yow.industrialtelemetrygatewayjava.model.Sample;
 import com.github.h3yow.industrialtelemetrygatewayjava.model.Snapshot;
 import com.github.h3yow.industrialtelemetrygatewayjava.model.WriteOutcome;
+import com.github.h3yow.industrialtelemetrygatewayjava.model.BatchWriteResult;
 import com.github.h3yow.industrialtelemetrygatewayjava.model.WriteRequest;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
@@ -14,7 +17,6 @@ import org.springframework.web.bind.annotation.RestController;
 
 import java.util.List;
 import java.util.Map;
-
 /**
  * 点位读写与一致性批量读取接口：
  * <ul>
@@ -50,9 +52,9 @@ public class GatewayController {
     }
 
     @PostMapping("/devices/{deviceId}/points/{name}/writes")
-    public WriteResultDto write(@PathVariable String deviceId,
-                                @PathVariable String name,
-                                @RequestBody WriteRequestDto request) {
+    public ResponseEntity<WriteResultDto> write(@PathVariable String deviceId,
+                                                @PathVariable String name,
+                                                @RequestBody WriteRequestDto request) {
         Number value = request.value();
         if (value == null) {
             throw new IllegalArgumentException("value is required");
@@ -63,10 +65,39 @@ public class GatewayController {
                 ? "CAS accepted at committedVersion=" + outcome.committedVersion()
                 : "stale version: expected " + request.expectedVersion()
                         + " but actual " + outcome.actualVersion();
-        return new WriteResultDto(outcome.accepted(),
+        WriteResultDto body = new WriteResultDto(outcome.accepted(),
                 outcome.committedVersion(),
                 outcome.actualVersion(),
                 outcome.currentValue(),
                 reason);
+        return outcome.accepted()
+                ? ResponseEntity.ok(body)
+                : ResponseEntity.status(HttpStatus.CONFLICT).body(body);
+    }
+
+    /**
+     * 原子批量写：请求体内一组点位作为一次逻辑提交，
+     * 任一点位版本过期/非法则整批拒绝（HTTP 409 或对应分类错误）。
+     */
+    @PostMapping("/devices/{deviceId}/points/batch-writes")
+    public ResponseEntity<BatchWriteResult> batchWrite(@PathVariable String deviceId,
+                                                       @RequestBody List<BatchWriteItemDto> items) {
+        if (items == null || items.isEmpty()) {
+            throw new IllegalArgumentException("items must not be empty");
+        }
+        List<WriteRequest> requests = items.stream()
+                .map(item -> {
+                    if (item.name() == null || item.value() == null) {
+                        throw new IllegalArgumentException("each item requires name and value");
+                    }
+                    return new WriteRequest(deviceId, item.name(), item.value(),
+                            item.expectedVersion());
+                })
+                .toList();
+        BatchWriteResult result = gateway.writeBatch(deviceId, requests);
+        // 过期批次按冲突返回，正文仍携带逐点位仲裁结果与原因
+        return result.accepted()
+                ? ResponseEntity.ok(result)
+                : ResponseEntity.status(HttpStatus.CONFLICT).body(result);
     }
 }
